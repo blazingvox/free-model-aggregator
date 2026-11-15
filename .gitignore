@@ -3,4 +3,7 @@ node_modules/
 .env.*
 !.env.example
 .makefun/
+!.makefun/
+.makefun/*
+!.makefun/owner.json
 *.log
