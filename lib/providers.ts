@@ -168,7 +168,7 @@ export function authHeaders(auth: AuthScheme, key: string): Record<string, strin
 }
 
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
+export function documentsIn(text: string): Json[] {
   const out: Json[] = [];
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
     const end = objectEnd(text, start);
@@ -219,11 +219,13 @@ function providerOf(v: unknown): ProviderDirectoryEntry | null {
   const id = stringOf(v.id);
   const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
   if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
+  if (v.auth !== undefined && v.auth !== 'bearer' && v.auth !== 'x-api-key' && v.auth !== 'x-goog-api-key' && v.auth !== 'none') return null;
+  const auth = v.auth === undefined ? 'bearer' : v.auth;
   // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
   // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
   const base =
     stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
+  if (base.trim() === '') return null;
   return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
 }
 
@@ -358,7 +360,8 @@ function zeroPriced(v: Json): boolean | null {
     return [];
   });
   if (values.length === 0) return null;
-  return values.every((n) => Number.isFinite(n) && n === 0);
+  if (values.some((n) => !Number.isFinite(n))) return null;
+  return values.every((n) => n === 0);
 }
 
 /** One model as a listing wrote it, in whichever wire's spelling. */
@@ -401,7 +404,9 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
     const body: unknown = await res.json();
     return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
   } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+    const message = err instanceof Error ? err.message : String(err);
+    const safeMessage = provider.key === '' ? message : message.split(provider.key).join('[redacted]');
+    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${safeMessage}` };
   }
 }
 

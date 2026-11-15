@@ -241,9 +241,218 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   };
 }
 
+/** Convert a native Anthropic Messages response to Chat Completions, retaining tool calls and accounting. */
+export function nativeAnthropicToOpenAI(body: Json, model: string): Json {
+  const content = Array.isArray(body.content) ? body.content : [];
+  const text = content.filter(isRecord).filter((b) => b.type === 'text' && typeof b.text === 'string').map((b) => b.text as string).join('');
+  const calls: Json[] = content.filter(isRecord).filter((b) => b.type === 'tool_use').map((b, i) => ({ id: typeof b.id === 'string' ? b.id : `call_${i}`, type: 'function', function: { name: b.name ?? '', arguments: JSON.stringify(isRecord(b.input) ? b.input : {}) } }));
+  const usage = isRecord(body.usage) ? body.usage : {};
+  const finish = body.stop_reason === 'max_tokens' ? 'length' : body.stop_reason === 'tool_use' ? 'tool_calls' : body.stop_reason === 'refusal' ? 'content_filter' : 'stop';
+  return { id: body.id ?? 'anthropic-response', object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) }, finish_reason: finish }], usage: { prompt_tokens: numberOrZero(usage.input_tokens), completion_tokens: numberOrZero(usage.output_tokens), total_tokens: numberOrZero(usage.input_tokens) + numberOrZero(usage.output_tokens) } };
+}
+
+/** Chat Completions request as Anthropic Messages, including prior tool calls/results and image blocks. */
+export function openAIToNativeAnthropic(body: Json, model: string): Json {
+  const source = Array.isArray(body.messages) ? body.messages : [];
+  let system = '';
+  const messages: Json[] = [];
+  for (const raw of source) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system' || raw.role === 'developer') { system += (system ? '\n' : '') + textOf(raw.content); continue; }
+    if (raw.role === 'tool') {
+      const last = messages.at(-1);
+      const result = { type: 'tool_result', tool_use_id: raw.tool_call_id ?? '', content: typeof raw.content === 'string' ? raw.content : JSON.stringify(raw.content ?? '') };
+      if (isRecord(last) && last.role === 'user' && Array.isArray(last.content)) (last.content as Json[]).push(result);
+      else messages.push({ role: 'user', content: [result] });
+      continue;
+    }
+    const role = raw.role === 'assistant' ? 'assistant' : 'user';
+    const blocks: Json[] = [];
+    if (typeof raw.content === 'string' && raw.content) blocks.push({ type: 'text', text: raw.content });
+    else if (Array.isArray(raw.content)) for (const p of raw.content) if (isRecord(p)) {
+      if (typeof p.text === 'string') blocks.push({ type: 'text', text: p.text });
+      if (p.type === 'image_url' && isRecord(p.image_url) && typeof p.image_url.url === 'string') {
+        const m = /^data:([^;]+);base64,(.*)$/s.exec(p.image_url.url);
+        if (m) blocks.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+        else blocks.push({ type: 'image', source: { type: 'url', url: p.image_url.url } });
+      }
+    }
+    if (Array.isArray(raw.tool_calls)) for (const call of raw.tool_calls) if (isRecord(call) && isRecord(call.function)) blocks.push({ type: 'tool_use', id: call.id ?? '', name: call.function.name ?? '', input: argumentsOf(call.function.arguments) });
+    messages.push({ role, content: blocks.length ? blocks : [{ type: 'text', text: '' }] });
+  }
+  const out: Json = { model, max_tokens: typeof body.max_tokens === 'number' ? body.max_tokens : 1024, messages, stream: body.stream === true };
+  if (system) out.system = system;
+  for (const key of ['temperature', 'top_p'] as const) if (typeof body[key] === 'number') out[key] = body[key];
+  if (Array.isArray(body.stop)) out.stop_sequences = body.stop;
+  if (Array.isArray(body.tools)) out.tools = body.tools.flatMap((t) => isRecord(t) && isRecord(t.function) ? [{ name: t.function.name, description: t.function.description ?? '', input_schema: t.function.parameters ?? { type: 'object' } }] : []);
+  if (body.tool_choice === 'none') out.tool_choice = { type: 'none' };
+  else if (body.tool_choice === 'auto' || body.tool_choice === 'required') out.tool_choice = { type: body.tool_choice === 'required' ? 'any' : 'auto' };
+  else if (isRecord(body.tool_choice) && isRecord(body.tool_choice.function)) out.tool_choice = { type: 'tool', name: body.tool_choice.function.name };
+  if (isRecord(body.response_format) && ['json_object', 'json_schema'].includes(String(body.response_format.type))) {
+    const format = isRecord(body.response_format.json_schema) && isRecord(body.response_format.json_schema.schema) ? body.response_format.json_schema.schema : { type: 'object' };
+    out.output_config = { format: { type: 'json_schema', schema: format } };
+  }
+  return out;
+}
+
+/** Convert an OpenAI Chat Completions request to Gemini generateContent. */
+export function openAIToGemini(body: Json): Json {
+  const source = Array.isArray(body.messages) ? body.messages : [];
+  let systemText = '';
+  const contents: Json[] = [];
+  const toolNames = new Map<string, string>();
+  for (const raw of source) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system' || raw.role === 'developer') {
+      const text = textOf(raw.content);
+      if (text !== '') systemText += (systemText ? '\n' : '') + text;
+      continue;
+    }
+    const role = raw.role === 'assistant' ? 'model' : 'user';
+    const parts: Json[] = [];
+    if (typeof raw.content === 'string') parts.push({ text: raw.content });
+    else if (Array.isArray(raw.content)) for (const p of raw.content) {
+      if (!isRecord(p)) continue;
+      if (typeof p.text === 'string') parts.push({ text: p.text });
+      if (p.type === 'image_url' && isRecord(p.image_url) && typeof p.image_url.url === 'string') {
+        const match = /^data:([^;]+);base64,(.*)$/s.exec(p.image_url.url);
+        if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+        else parts.push({ fileData: { fileUri: p.image_url.url, mimeType: 'image/jpeg' } });
+      }
+    }
+    if (Array.isArray(raw.tool_calls)) for (const call of raw.tool_calls) if (isRecord(call) && isRecord(call.function)) {
+      let args: unknown = {};
+      try { args = JSON.parse(String(call.function.arguments ?? '{}')); } catch { args = {}; }
+      if (typeof call.id === 'string' && typeof call.function.name === 'string') toolNames.set(call.id, call.function.name);
+      parts.push({ functionCall: { name: call.function.name, args } });
+    }
+    if (raw.role === 'tool') parts.push({ functionResponse: { name: (typeof raw.tool_call_id === 'string' ? toolNames.get(raw.tool_call_id) : undefined) ?? raw.name ?? raw.tool_call_id, response: { content: textOf(raw.content) } } });
+    contents.push({ role, parts });
+  }
+  const generationConfig: Json = {};
+  if (typeof body.max_tokens === 'number' || typeof body.max_completion_tokens === 'number') generationConfig.maxOutputTokens = body.max_tokens ?? body.max_completion_tokens;
+  if (typeof body.temperature === 'number') generationConfig.temperature = body.temperature;
+  if (typeof body.top_p === 'number') generationConfig.topP = body.top_p;
+  if (Array.isArray(body.stop)) generationConfig.stopSequences = body.stop;
+  if (isRecord(body.response_format) && ['json_object', 'json_schema'].includes(String(body.response_format.type))) generationConfig.responseMimeType = 'application/json';
+  const out: Json = { contents, generationConfig };
+  if (systemText) out.systemInstruction = { parts: [{ text: systemText }] };
+  if (Array.isArray(body.tools)) {
+    const functionDeclarations = body.tools.flatMap((t) => isRecord(t) && isRecord(t.function) ? [{ name: t.function.name, description: t.function.description, parameters: t.function.parameters }] : []);
+    if (functionDeclarations.length) out.tools = [{ functionDeclarations }];
+  }
+  return out;
+}
+
+/** Gemini generateContent response in Chat Completions shape. */
+export function geminiToOpenAI(body: Json, model: string): Json {
+  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+  const candidate = isRecord(candidates[0]) ? candidates[0] : {};
+  const content = isRecord(candidate.content) ? candidate.content : {};
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  let text = '';
+  const calls: Json[] = [];
+  for (const part of parts) if (isRecord(part)) {
+    if (typeof part.text === 'string') text += part.text;
+    if (isRecord(part.functionCall)) calls.push({ id: `call_${calls.length}`, type: 'function', function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args ?? {}) } });
+  }
+  const reason = candidate.finishReason === 'MAX_TOKENS' ? 'length' : calls.length ? 'tool_calls' : candidate.finishReason === 'SAFETY' ? 'content_filter' : 'stop';
+  const usage = isRecord(body.usageMetadata) ? body.usageMetadata : {};
+  const prompt = numberOrZero(usage.promptTokenCount), completion = numberOrZero(usage.candidatesTokenCount);
+  return { id: 'gemini-response', object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) }, finish_reason: reason }], usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: numberOrZero(usage.totalTokenCount) || prompt + completion } };
+}
+
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
 export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Deterministic OpenAI SSE representation of a completed normalized response. */
+export function* openAIEventsFromCompletion(answer: Json): Generator<string> {
+  const choices = Array.isArray(answer.choices) ? answer.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const id = typeof answer.id === 'string' ? answer.id : 'chatcmpl_aggregate';
+  const model = typeof answer.model === 'string' ? answer.model : 'auto';
+  yield sseEvent(null, { id, object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
+  if (typeof message.content === 'string' && message.content) yield sseEvent(null, { id, object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: message.content }, finish_reason: null }] });
+  if (Array.isArray(message.tool_calls)) for (let i = 0; i < message.tool_calls.length; i++) {
+    const call = message.tool_calls[i]; if (!isRecord(call) || !isRecord(call.function)) continue;
+    yield sseEvent(null, { id, object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: call.id, type: 'function', function: { name: call.function.name, arguments: call.function.arguments } }] }, finish_reason: null }] });
+  }
+  yield sseEvent(null, { id, object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? 'stop' }] });
+  if (isRecord(answer.usage)) yield sseEvent(null, { id, object: 'chat.completion.chunk', model, choices: [], usage: answer.usage });
+  yield 'data: [DONE]\n\n';
+}
+
+/** Collect provider-specific SSE frames into native JSON before the common response normalizers run. */
+export async function collectVendorStream(stream: ReadableStream<Uint8Array>, wire: 'anthropic' | 'gemini'): Promise<Json> {
+  const reader = stream.getReader(); const decoder = new TextDecoder(); let buffer = ''; const frames: unknown[] = [];
+  const collect = (frame: string): void => {
+    const data = frame.split('\n').filter((x) => x.startsWith('data:')).map((x) => x.slice(5).trim()).join('\n');
+    if (!data || data === '[DONE]') return;
+    try { const value: unknown = JSON.parse(data); if (Array.isArray(value)) frames.push(...value); else frames.push(value); } catch { /* ignore malformed keepalive frames */ }
+  };
+  try {
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at; while ((at = buffer.indexOf('\n\n')) >= 0) { collect(buffer.slice(0, at)); buffer = buffer.slice(at + 2); }
+    }
+    buffer += decoder.decode(); if (buffer.trim()) collect(buffer);
+  } finally { reader.releaseLock(); }
+  if (wire === 'gemini') {
+    const parts: Json[] = []; let candidate: Json = {}; let usage: Json = {};
+    for (const v of frames) if (isRecord(v)) {
+      const cs = Array.isArray(v.candidates) ? v.candidates : [];
+      if (isRecord(cs[0])) { const c = cs[0]; candidate = { ...candidate, ...c }; const content = isRecord(c.content) ? c.content : {}; if (Array.isArray(content.parts)) parts.push(...content.parts.filter(isRecord)); }
+      if (isRecord(v.usageMetadata)) usage = v.usageMetadata;
+    }
+    return { candidates: [{ ...candidate, content: { role: 'model', parts } }], usageMetadata: usage };
+  }
+  let message: Json = { id: 'msg_stream', content: [], usage: {} }; const blocks = new Map<number, Json>(); let stop: unknown = 'end_turn';
+  for (const v of frames) if (isRecord(v)) {
+    if (v.type === 'message_start' && isRecord(v.message)) message = { ...v.message, content: [] };
+    if (v.type === 'content_block_start' && typeof v.index === 'number' && isRecord(v.content_block)) blocks.set(v.index, { ...v.content_block, ...(v.content_block.type === 'text' ? { text: '' } : v.content_block.type === 'tool_use' ? { input: {} } : {}) });
+    if (v.type === 'content_block_delta' && typeof v.index === 'number' && isRecord(v.delta)) {
+      const b = blocks.get(v.index); if (b && v.delta.type === 'text_delta') b.text = String(b.text ?? '') + String(v.delta.text ?? '');
+      if (b && v.delta.type === 'input_json_delta') { const raw = String((b as any).__raw ?? '') + String(v.delta.partial_json ?? ''); (b as any).__raw = raw; try { b.input = JSON.parse(raw); } catch { /* partial JSON until the next delta */ } }
+    }
+    if (v.type === 'message_delta' && isRecord(v.delta)) { stop = v.delta.stop_reason ?? stop; message.usage = { ...(isRecord(message.usage) ? message.usage : {}), ...(isRecord(v.usage) ? v.usage : {}) }; }
+  }
+  message.content = [...blocks.entries()].sort((a,b)=>a[0]-b[0]).map(([,b]) => { delete (b as any).__raw; return b; }); message.stop_reason = stop; return message;
+}
+
+/** Collect OpenAI SSE deltas into one completion, retaining fragmented tool JSON and final usage. */
+export async function collectOpenAIStream(stream: ReadableStream<Uint8Array>): Promise<Json> {
+  const reader = stream.getReader(), decoder = new TextDecoder(); let buffer = '', id = 'chatcmpl_stream', model = 'auto', text = '', finish: unknown = 'stop', usage: Json = {};
+  const tools = new Map<number, { id: string; name: string; args: string }>();
+  const frame = (raw: string): void => {
+    for (const line of raw.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim(); if (!data || data === '[DONE]') continue;
+      let v: unknown; try { v = JSON.parse(data); } catch { continue; }
+      if (!isRecord(v)) continue;
+      if (typeof v.id === 'string') id = v.id; if (typeof v.model === 'string') model = v.model;
+      if (isRecord(v.usage)) usage = v.usage;
+      const cs = Array.isArray(v.choices) ? v.choices : []; const c = isRecord(cs[0]) ? cs[0] : null; if (!c) continue;
+      const d = isRecord(c.delta) ? c.delta : {};
+      if (typeof d.content === 'string') text += d.content;
+      if (Array.isArray(d.tool_calls)) for (const tc of d.tool_calls) if (isRecord(tc)) {
+        const i = typeof tc.index === 'number' ? tc.index : tools.size; let t = tools.get(i);
+        if (!t) { t = { id: '', name: '', args: '' }; tools.set(i, t); }
+        if (typeof tc.id === 'string') t.id += tc.id;
+        if (isRecord(tc.function)) { if (typeof tc.function.name === 'string') t.name += tc.function.name; if (typeof tc.function.arguments === 'string') t.args += tc.function.arguments; }
+      }
+      if (c.finish_reason !== null && c.finish_reason !== undefined) finish = c.finish_reason;
+    }
+  };
+  try {
+    for (;;) { const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n'); let at; while ((at = buffer.indexOf('\n\n')) >= 0) { frame(buffer.slice(0, at)); buffer = buffer.slice(at + 2); } }
+    buffer += decoder.decode(); if (buffer.trim()) frame(buffer);
+  } finally { reader.releaseLock(); }
+  const calls = [...tools.entries()].sort((a,b)=>a[0]-b[0]).map(([i,t]) => ({ id: t.id || `call_${i}`, type: 'function', function: { name: t.name, arguments: t.args || '{}' } }));
+  return { id, object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) }, finish_reason: finish }], usage };
 }
 
 /**
@@ -251,7 +460,7 @@ export function sseEvent(event: string | null, data: unknown): string {
  * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
  * usage, then message_stop. `model` is the model the client asked for, named back to it.
  */
-export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
+export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string, initialInputTokens = 0): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -262,7 +471,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let textIndex = -1;
   let nextIndex = 0;
   const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
+  let inputTokens = initialInputTokens;
   let outputTokens = 0;
 
   const startEvents = (): string[] => {
